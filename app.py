@@ -412,10 +412,6 @@ else:
             if st.session_state.last_result:
                 render_result(st.session_state.last_result)
 
-        # Display last result if available
-        if st.session_state.get("last_result"):
-            render_result(st.session_state.last_result)
-
         with st.container(border=True):
             for m in st.session_state.chat:
                 if m["role"] == "user":
@@ -423,32 +419,60 @@ else:
                 else:
                     st.markdown(m["content"])
 
-            q = st.text_input("Ask a question...", key="chat_input")
-            cA, cB = st.columns([1, 0.25])
-            ask = cA.button("Ask", type="primary")
-            clear = cB.button("Clear chat")
+            with st.form("chat_form", clear_on_submit=False):
+                q = st.text_input("Ask a question...", key="chat_input")
+                cA, cB = st.columns([1, 0.25])
+                submitted = cA.form_submit_button("Ask", type="primary")
+                clear = cB.form_submit_button("Clear chat")
 
             if clear:
                 st.session_state.chat = []
                 st.session_state.last_result = None
+                st.session_state['busy'] = False
                 st.rerun()
 
-            if ask and q.strip():
+            if submitted and q.strip():
                 if not api_key:
                     st.error("Enter your OpenAI API Key in the sidebar.")
                 else:
-                    st.session_state.chat.append({"role": "user", "content": q})
+                    if st.session_state.get('busy'):
+                        st.info("Working... ignored duplicate click.")
+                    else:
+                        st.session_state['busy'] = True
+                        st.session_state.chat.append({"role": "user", "content": q})
+                        try:
+                            resp = ask_model_for_code(api_key, model, st.session_state.df, q)
+                            code = extract_code(resp)
+                            result = run_user_code(code, st.session_state.df)
+                            st.session_state.last_result = result
+                            render_result(result)
+                        except Exception:
+                            st.session_state.chat.append({
+                                "role": "assistant",
+                                "content": f"❌ Error
+
+    ````text
+    {traceback.format_exc()}
+    ````"
+                            })
+                        finally:
+                            st.session_state['busy'] = False
                     try:
                         resp = ask_model_for_code(api_key, model, st.session_state.df, q)
                         code = extract_code(resp)
                         result = run_user_code(code, st.session_state.df)
-                        st.session_state.last_result = result
-                        render_result(result)
+                        # Only save and render if result is not empty
+                        if result and (result.get("answer_text") or result.get("answer_table") or result.get("fig")):
+                            st.session_state.last_result = result
+                            render_result(result)
+                        else:
+                            st.warning("No output generated for this request.")
                     except Exception:
                         st.session_state.chat.append({
                             "role": "assistant",
                             "content": f"❌ Error\n\n````text\n{traceback.format_exc()}\n````"
                         })
+
 
 
 # footer
