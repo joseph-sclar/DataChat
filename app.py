@@ -231,8 +231,8 @@ def run_user_code(code: str, df: "pd.DataFrame"):
         "text": text,
         "table": table,
         "figure": figure,
-        "code": code,      # kept internally (not displayed)
-        "stdout": stdout,  # shown under expander if present
+        "code": code,      
+        "stdout": stdout,  
         "error": None
     }
 
@@ -261,7 +261,7 @@ with st.sidebar:
     # auto-fill API key from env or Streamlit secrets
     default_key = os.getenv("OPENAI_API_KEY", "")
     try:
-        default_key = st.secrets.get("OPENAI_API_KEY", default_key)  # type: ignore[attr-defined]
+        default_key = st.secrets.get("OPENAI_API_KEY", default_key)  
     except Exception:
         pass
     api_key = st.text_input("OpenAI API Key", type="password", value=default_key)
