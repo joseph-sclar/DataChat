@@ -399,27 +399,40 @@ else:
             st.markdown("- No obvious takeaways detected.")
 
     # Chatbot
+    # Inside Chatbot tab
     with tabs[3]:
         st.subheader("Chat with your data")
         header_info = pd.DataFrame({
-            "column": st.session_state.df.columns,
-            "dtype": [str(st.session_state.df[c].dtype) for c in st.session_state.df.columns],
-            "n_unique": [int(st.session_state.df[c].nunique(dropna=True)) for c in st.session_state.df.columns],
+            "Column": st.session_state.df.columns if st.session_state.df is not None else [],
+            "Type": st.session_state.df.dtypes.astype(str) if st.session_state.df is not None else []
         })
-        st.dataframe(header_info, use_container_width=True)
+        if not header_info.empty:
+            st.dataframe(header_info, use_container_width=True)
+            # show last result (table/plot) at the top so it persists across reruns
+            if st.session_state.last_result:
+                render_result(st.session_state.last_result)
+
+        # Display last result if available
+        if st.session_state.get("last_result"):
+            render_result(st.session_state.last_result)
+
         with st.container(border=True):
             for m in st.session_state.chat:
                 if m["role"] == "user":
                     st.markdown(f"**You:** {m['content']}")
                 else:
                     st.markdown(m["content"])
-            q = st.text_input("Ask a question (e.g., 'Top 10 products by revenue' or 'Plot monthly trend')", key="chat_input")
+
+            q = st.text_input("Ask a question...", key="chat_input")
             cA, cB = st.columns([1, 0.25])
             ask = cA.button("Ask", type="primary")
             clear = cB.button("Clear chat")
+
             if clear:
                 st.session_state.chat = []
+                st.session_state.last_result = None
                 st.rerun()
+
             if ask and q.strip():
                 if not api_key:
                     st.error("Enter your OpenAI API Key in the sidebar.")
@@ -429,15 +442,14 @@ else:
                         resp = ask_model_for_code(api_key, model, st.session_state.df, q)
                         code = extract_code(resp)
                         result = run_user_code(code, st.session_state.df)
+                        st.session_state.last_result = result
                         render_result(result)
                     except Exception:
                         st.session_state.chat.append({
                             "role": "assistant",
                             "content": f"❌ Error\n\n````text\n{traceback.format_exc()}\n````"
                         })
-        if st.session_state.last_result and not ask:
-            st.markdown("### Last result")
-            render_result(st.session_state.last_result)
+
 
 # footer
 st.caption("© 2025 Joseph Sclar · joseph.sclar2@gmail.com")
