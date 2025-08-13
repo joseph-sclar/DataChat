@@ -29,9 +29,13 @@ APP_TITLE = "DataChat"
 SYSTEM_RULES = (
     "You answer by emitting ONLY Python code. A pandas DataFrame named df is provided.\n"
     "Use only pandas, numpy, matplotlib (pd, np, plt). No I/O or other imports.\n"
-    "Set variables: answer_text (str), optional answer_table (pd.DataFrame).\n"
-    "If plotting helps, create a matplotlib figure (use plt.figure(); fig = plt.gcf()).\n"
-    "If you make assumptions, say them briefly in answer_text."
+    "ALWAYS create a pandas DataFrame named `answer_df` that directly answers the question "
+    "(even if it's one value -> one-row DataFrame with clear column names).\n"
+    "Optionally set `answer_text` (str) for a short explanation.\n"
+    "If plotting helps, create a matplotlib figure (use plt.figure(); fig = plt.gcf()). "
+    "Prefer calling the helper `_nice_bar(answer_df, x=<col>, y=<col>, title=..., top_n=..., fmt=...)` "
+    "for bar charts with long labels.\n"
+    "Do not print Streamlit code or any other UI code."
 )
 
 # ---------- OpenAI client ----------
@@ -52,7 +56,7 @@ def get_openai_client(api_key: str):
 def build_schema_prompt(df: pd.DataFrame) -> str:
     # small, JSON-serializable preview
     head = df.head(8).copy()
-    # convert non-serializable types (Timestamp, numpy types) to strings/primitives
+
     def _ser(x):
         if hasattr(x, "isoformat"):
             try:
@@ -65,6 +69,7 @@ def build_schema_prompt(df: pd.DataFrame) -> str:
             except Exception:
                 return str(x)
         return x
+
     head_serializable = head.applymap(_ser)
     head_json = head_serializable.to_dict(orient="list")
     schema_lines = [f"- {c}: {str(df[c].dtype)}" for c in df.columns]
@@ -111,40 +116,141 @@ FORBIDDEN_PATTERNS = [
     r"urllib",
 ]
 
-def run_user_code(code: str, df: pd.DataFrame):
-    for pat in FORBIDDEN_PATTERNS:
-        if re.search(pat, code):
-            raise RuntimeError("Generated code attempted a forbidden operation.")
-    g = {"pd": pd, "np": np, "plt": plt, "df": df.copy()}
-    l = {}
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        exec(code, g, l)
-    text = l.get("answer_text", "")
-    table = l.get("answer_table", None)
-    fig = plt.gcf() if plt.get_fignums() else None
-    return {"text": str(text) if text is not None else "", "table": table if isinstance(table, pd.DataFrame) else None, "stdout": buf.getvalue(), "figure": fig, "code": code}
+def run_user_code(code: str, df: "pd.DataFrame"):
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import io, contextlib, numpy as np, textwrap
 
+    # namespace the user code runs in
+    ns = {"pd": pd, "plt": plt, "np": np, "df": df.copy() if df is not None else None}
+
+    # --- chart helper available to generated code ---
+    def _nice_bar(data, x, y, title=None, top_n=None, fmt="{:,.0f}"):
+        import matplotlib.pyplot as _plt
+        import numpy as _np
+        import textwrap as _tw
+
+        def _fmt_val(v):
+            # Accept ":,.0f", "{:,.0f}", or even bad inputs like "{x:,.0f}"
+            try:
+                if fmt is None:
+                    return str(v)
+                if "{" in fmt:
+                    # if named field like "{x:,.0f}", strip the name to positional
+                    _clean = _tw.re.sub(r"\{[^:}]*:", "{:", fmt)
+                    return _clean.format(v)
+                else:
+                    # plain format spec like ":,.0f"
+                    return format(v, fmt)
+            except Exception:
+                # last-ditch fallback
+                try:
+                    return "{:,.0f}".format(v)
+                except Exception:
+                    return str(v)
+
+        dfp = data.copy()
+        if top_n:
+            dfp = dfp.sort_values(y, ascending=False).head(top_n)
+
+        # wrap long labels
+        def _wrap(s):
+            return "\n".join(_tw.wrap(str(s), width=14)) if isinstance(s, str) else s
+        dfp[x] = dfp[x].map(_wrap)
+
+        horizontal = len(dfp) > 10
+        _plt.figure(figsize=(11, 6) if not horizontal else (10, 8))
+
+        if horizontal:
+            _plt.barh(dfp[x], dfp[y])
+            _plt.xlabel(y); _plt.ylabel(x)
+        else:
+            _plt.bar(dfp[x], dfp[y])
+            _plt.ylabel(y); _plt.xlabel(x)
+            _plt.xticks(rotation=30, ha="right")
+
+        # value labels
+        ax = _plt.gca()
+        for b in ax.patches:
+            val = b.get_width() if horizontal else b.get_height()
+            if val is None or (isinstance(val, float) and _np.isnan(val)):
+                continue
+            txt = _fmt_val(val)
+            if horizontal:
+                ax.text(val, b.get_y() + b.get_height()/2, " " + txt, va="center")
+            else:
+                ax.text(b.get_x() + b.get_width()/2, val, txt, ha="center", va="bottom")
+
+        if title:
+            _plt.title(title)
+        _plt.tight_layout()
+        return _plt.gcf()
+
+
+    # expose helper to the exec namespace
+    ns["_nice_bar"] = _nice_bar
+
+    DF_CANDIDATE_NAMES = ["answer_df","result_df","output_df","df_out","table","result","output"]
+
+    figure = None
+    table = None
+    text = ""
+    stdout = ""
+
+    # run user code with stdout capture
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            exec(code, ns, ns)
+    finally:
+        stdout = buf.getvalue()
+
+    # capture a figure if any
+    if plt.get_fignums():
+        figure = plt.gcf()
+
+    # choose a table (prefer answer_df, else biggest DF in namespace, else coerce)
+    for name in DF_CANDIDATE_NAMES:
+        if isinstance(ns.get(name), pd.DataFrame):
+            table = ns[name]
+            break
+    if table is None:
+        dfs = [v for v in ns.values() if isinstance(v, pd.DataFrame)]
+        if dfs:
+            table = max(dfs, key=lambda d: (len(d), d.shape[1]))
+    if table is None:
+        for name in DF_CANDIDATE_NAMES:
+            obj = ns.get(name)
+            if isinstance(obj, (pd.Series, list, tuple)):
+                table = pd.DataFrame(obj)
+                break
+
+    text = ns.get("answer_text", "")
+
+    return {
+        "text": text,
+        "table": table,
+        "figure": figure,
+        "code": code,      # kept internally (not displayed)
+        "stdout": stdout,  # shown under expander if present
+        "error": None
+    }
 
 def render_result(result: dict):
-    parts = []
-    if result["text"]:
-        parts.append(result["text"])
-    if result["stdout"]:
-        parts.append("````text\n" + result["stdout"].strip() + "\n````")
-    if not parts:
-        parts.append("(No textual summary returned)")
-    st.markdown("**Answer**\n\n" + "\n\n".join(parts))
-    if result["table"] is not None:
+    if result.get("text"):
+        st.markdown(result["text"])
+
+    if result.get("table") is not None:
         st.markdown("**Result table:**")
         st.dataframe(result["table"].head(100), use_container_width=True)
-    if result["figure"] is not None:
+
+    if result.get("figure") is not None:
         st.markdown("**Chart:**")
-        st.pyplot(result["figure"], clear_figure=True)
-    with st.expander("Show generated code"):
-        st.code(result["code"], language="python")
-    st.session_state.chat.append({"role": "assistant", "content": result["text"] or "(No answer)"})
-    st.session_state.last_result = result
+        st.pyplot(result["figure"], clear_figure=False, use_container_width=True)
+
+    if result.get("stdout"):
+        with st.expander("Console output"):
+            st.code(result["stdout"])
 
 # ---------- page ----------
 st.set_page_config(page_title=APP_TITLE, page_icon="💬", layout="wide")
@@ -293,7 +399,7 @@ else:
         st.subheader("What this app does")
         st.markdown(
             "**DataChat** lets you:\n"
-            "- Upload a CSV (or load a built‑in sample)\n"
+            "- Upload a CSV (or load a built-in sample)\n"
             "- Map columns to the right data types\n"
             "- Get a quick EDA with automatic takeaways\n"
             "- Ask questions in natural language and get answers, tables, and charts"
@@ -398,31 +504,48 @@ else:
         else:
             st.markdown("- No obvious takeaways detected.")
 
-    # Chatbot
-    # Inside Chatbot tab
     with tabs[3]:
         st.subheader("Chat with your data")
+
+        # Compact schema header
         header_info = pd.DataFrame({
             "Column": st.session_state.df.columns if st.session_state.df is not None else [],
             "Type": st.session_state.df.dtypes.astype(str) if st.session_state.df is not None else []
         })
         if not header_info.empty:
             st.dataframe(header_info, use_container_width=True)
-            # show last result (table/plot) at the top so it persists across reruns
-            if st.session_state.last_result:
-                render_result(st.session_state.last_result)
+
+        # Persistently show the last successful result without re-appending to chat
+        lr = st.session_state.get("last_result")
+        if lr and (lr.get("text") or lr.get("table") is not None or lr.get("figure") is not None):
+            st.markdown("**Last result**")
+            if lr.get("text"):
+                st.markdown(lr["text"])  # show text only (no chat append)
+            if lr.get("table") is not None:
+                st.markdown("**Result table:**")
+                st.dataframe(lr["table"].head(100), use_container_width=True)
+            if lr.get("figure") is not None:
+                st.markdown("**Chart:**")
+                st.pyplot(lr["figure"], clear_figure=False, use_container_width=True)
+            if lr.get("stdout"):
+                with st.expander("Console output"):
+                    st.code(lr["stdout"])
 
         with st.container(border=True):
+            # Chat history (messages only)
             for m in st.session_state.chat:
                 if m["role"] == "user":
                     st.markdown(f"**You:** {m['content']}")
                 else:
-                    st.markdown(m["content"])
+                    st.markdown(m["content"])  
 
+            # Submit form with debounce & disabled state to avoid double execution
             with st.form("chat_form", clear_on_submit=False):
                 q = st.text_input("Ask a question...", key="chat_input")
                 cA, cB = st.columns([1, 0.25])
-                submitted = cA.form_submit_button("Ask", type="primary")
+                submitted = cA.form_submit_button(
+                    "Ask", type="primary", disabled=st.session_state.get('busy', False)
+                )
                 clear = cB.form_submit_button("Clear chat")
 
             if clear:
@@ -435,45 +558,37 @@ else:
                 if not api_key:
                     st.error("Enter your OpenAI API Key in the sidebar.")
                 else:
-                    if st.session_state.get('busy'):
-                        st.info("Working... ignored duplicate click.")
+                    # Time-based debounce for accidental double submits of the same prompt
+                    import time as _time
+                    now = _time.time()
+                    last_q = st.session_state.get("last_prompt")
+                    last_t = st.session_state.get("last_submit_at", 0.0)
+                    if last_q == q and (now - last_t) < 1.2:
+                        st.info("Ignored duplicate click.")
                     else:
                         st.session_state['busy'] = True
+                        st.session_state['last_prompt'] = q
+                        st.session_state['last_submit_at'] = now
                         st.session_state.chat.append({"role": "user", "content": q})
                         try:
-                            resp = ask_model_for_code(api_key, model, st.session_state.df, q)
-                            code = extract_code(resp)
-                            result = run_user_code(code, st.session_state.df)
-                            st.session_state.last_result = result
-                            render_result(result)
+                            with st.spinner("Thinking..."):
+                                resp = ask_model_for_code(api_key, model, st.session_state.df, q)
+                                code = extract_code(resp)
+                                result = run_user_code(code, st.session_state.df)
+                            # Only save and display if we actually got something
+                            if result and (result.get("text") or result.get("table") is not None or result.get("figure") is not None):
+                                st.session_state.last_result = result
+                                # Render via the unified renderer
+                                render_result(result)
+                            else:
+                                st.warning("No output generated for this request.")
                         except Exception:
                             st.session_state.chat.append({
                                 "role": "assistant",
-                                "content": f"❌ Error
-
-    ````text
-    {traceback.format_exc()}
-    ````"
+                                "content": "❌ Error\n\n````text\n" + traceback.format_exc() + "\n````"
                             })
                         finally:
                             st.session_state['busy'] = False
-                    try:
-                        resp = ask_model_for_code(api_key, model, st.session_state.df, q)
-                        code = extract_code(resp)
-                        result = run_user_code(code, st.session_state.df)
-                        # Only save and render if result is not empty
-                        if result and (result.get("answer_text") or result.get("answer_table") or result.get("fig")):
-                            st.session_state.last_result = result
-                            render_result(result)
-                        else:
-                            st.warning("No output generated for this request.")
-                    except Exception:
-                        st.session_state.chat.append({
-                            "role": "assistant",
-                            "content": f"❌ Error\n\n````text\n{traceback.format_exc()}\n````"
-                        })
-
-
 
 # footer
 st.caption("© 2025 Joseph Sclar · joseph.sclar2@gmail.com")
