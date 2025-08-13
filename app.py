@@ -50,8 +50,23 @@ def get_openai_client(api_key: str):
 # ---------- helpers ----------
 
 def build_schema_prompt(df: pd.DataFrame) -> str:
+    # small, JSON-serializable preview
     head = df.head(8).copy()
-    head_json = json.loads(head.to_json(orient="list", date_format="iso"))
+    # convert non-serializable types (Timestamp, numpy types) to strings/primitives
+    def _ser(x):
+        if hasattr(x, "isoformat"):
+            try:
+                return x.isoformat()
+            except Exception:
+                return str(x)
+        if hasattr(x, "item"):
+            try:
+                return x.item()
+            except Exception:
+                return str(x)
+        return x
+    head_serializable = head.applymap(_ser)
+    head_json = head_serializable.to_dict(orient="list")
     schema_lines = [f"- {c}: {str(df[c].dtype)}" for c in df.columns]
     return (
         "Columns and dtypes:\n" + "\n".join(schema_lines) +
@@ -137,7 +152,13 @@ st.title("🗂️ DataChat")
 
 with st.sidebar:
     st.subheader("Settings")
-    api_key = st.text_input("OpenAI API Key", type="password", value=os.getenv("OPENAI_API_KEY", ""))
+    # auto-fill API key from env or Streamlit secrets
+    default_key = os.getenv("OPENAI_API_KEY", "")
+    try:
+        default_key = st.secrets.get("OPENAI_API_KEY", default_key)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    api_key = st.text_input("OpenAI API Key", type="password", value=default_key)
     model = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1"], index=0)
 
     st.markdown("---")
